@@ -27,7 +27,8 @@
 </li>
 <li><a href="#_需要注意的点">1.4. 需要注意的点</a></li>
 <li><a href="#_收获">1.5. 收获</a></li>
-<li><a href="#_参考资料">1.6. 参考资料</a></li>
+<li><a href="#_思考题">1.6. 思考题</a></li>
+<li><a href="#_参考资料">1.7. 参考资料</a></li>
 </ul>
 </li>
 </ul>
@@ -37,9 +38,163 @@
 <div class="sect1">
 <h2 id="_threadpoolexecutor_源码分析"><a class="anchor" href="#_threadpoolexecutor_源码分析"></a>1. ThreadPoolExecutor 源码分析</h2>
 <div class="sectionbody">
+<table class="tableblock frame-all grid-all stretch">
+<colgroup>
+<col style="width: 10.1123%;">
+<col style="width: 37.0786%;">
+<col style="width: 10.1123%;">
+<col style="width: 42.6968%;">
+</colgroup>
+<thead>
+<tr>
+<th class="tableblock halign-left valign-top">状态名称</th>
+<th class="tableblock halign-left valign-top">比特位</th>
+<th class="tableblock halign-left valign-top">十进制</th>
+<th class="tableblock halign-left valign-top">描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">RUNNING</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">111-00000000000000000000000000000</p></td>
+<td class="tableblock halign-right valign-top"><p class="tableblock">-536870912</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">运行中状态，可以接收新的任务和执行任务队列中的任务</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">SHUTDOWN</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">000-00000000000000000000000000000</p></td>
+<td class="tableblock halign-right valign-top"><p class="tableblock">0</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">shutdown状态，不再接收新的任务，但是会执行任务队列中的任务</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">STOP</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">001-00000000000000000000000000000</p></td>
+<td class="tableblock halign-right valign-top"><p class="tableblock">536870912</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">停止状态，不再接收新的任务，也不会执行任务队列中的任务，中断所有执行中的任务</p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">TIDYING</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">010-00000000000000000000000000000</p></td>
+<td class="tableblock halign-right valign-top"><p class="tableblock">1073741824</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">整理中状态，所有任务已经终结，工作线程数为0，过渡到此状态的工作线程会调用钩子方法 <code>terminated()</code></p></td>
+</tr>
+<tr>
+<td class="tableblock halign-left valign-top"><p class="tableblock">TERMINATED</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">011-00000000000000000000000000000</p></td>
+<td class="tableblock halign-right valign-top"><p class="tableblock">1610612736</p></td>
+<td class="tableblock halign-left valign-top"><p class="tableblock">终结状态，钩子方法 <code>terminated()</code> 执行完毕</p></td>
+</tr>
+</tbody>
+</table>
+<div class="paragraph">
+<p>由于运行状态值存放在高3位，所以可以直接通过十进制值（甚至可以忽略低29位，直接用ctl进行比较，或者使用ctl和线程池状态常量进行比较）来比较和判断线程池的状态：工作线程数为0的前提下：<code>RUNNING(-536870912)</code> &lt; <code>SHUTDOWN(0)</code> &lt; <code>STOP(536870912)</code> &lt; <code>TIDYING(1073741824)</code> &lt; <code>TERMINATED(1610612736)</code>。</p>
+</div>
 <div class="imageblock">
 <div class="content">
-<img src="./images/ThreadPoolExecutor-process.png" alt="ThreadPoolExecutor process">
+<img src="./images/ThreadPoolExecutor-states.jpeg" alt="ThreadPoolExecutor states">
+</div>
+</div>
+<div class="listingblock">
+<div class="content">
+<pre class="highlight"><code class="language-java" data-lang="java">/**
+ * Executes the given task sometime in the future.  The task
+ * may execute in a new thread or in an existing pooled thread.
+ *
+ * If the task cannot be submitted for execution, either because this
+ * executor has been shutdown or because its capacity has been reached,
+ * the task is handled by the current {@link RejectedExecutionHandler}.
+ *
+ * @param command the task to execute
+ * @throws RejectedExecutionException at discretion of
+ *         {@code RejectedExecutionHandler}, if the task
+ *         cannot be accepted for execution
+ * @throws NullPointerException if {@code command} is null
+ */
+public void execute(Runnable command) {
+    if (command == null)
+        throw new NullPointerException();
+    /*
+     * Proceed in 3 steps:
+     *
+     * 1. If fewer than corePoolSize threads are running, try to
+     * start a new thread with the given command as its first
+     * task.  The call to addWorker atomically checks runState and
+     * workerCount, and so prevents false alarms that would add
+     * threads when it shouldn't, by returning false.
+     *
+     * 2. If a task can be successfully queued, then we still need
+     * to double-check whether we should have added a thread
+     * (because existing ones died since last checking) or that
+     * the pool shut down since entry into this method. So we
+     * recheck state and if necessary roll back the enqueuing if
+     * stopped, or start a new thread if there are none.
+     *
+     * 3. If we cannot queue task, then we try to add a new
+     * thread.  If it fails, we know we are shut down or saturated
+     * and so reject the task.
+     */
+    int c = ctl.get();
+    // 如果当前工作线程数小于核心线程数，则创建新的线程并执行传入的任务
+    if (workerCountOf(c) &lt; corePoolSize) {
+        if (addWorker(command, true))
+            // 创建核心线程成功则直接返回
+            return;
+        // 创建核心线程失败，则在其他任务提交时，已经创建了足够多的线程数
+        // 或者线程池关闭等等，总之线程池状态已经发生变化，
+        // 则更新 ctl 的临时变量
+        c = ctl.get();
+    }
+    // 运行到这里说明创建核心线程失败，则当前工作线程已经大于等于 corePoolSize
+    // 判断线程池是否运行并且尝试用非阻塞方法向任务队列中添加任务（失败则返回 false）
+    if (isRunning(c) &amp;&amp; workQueue.offer(command)) {
+        int recheck = ctl.get();
+        // 向任务队列投放任务成功，对线程池状态做二次检查
+        // 如果线程池状态不是运行中，则从任务队列中移除任务并执行拒绝策略
+        if (! isRunning(recheck) &amp;&amp; remove(command))
+            // 执行拒绝策略 -- 结束
+            reject(command);
+        // 走到下面的 else if 分支，则说明
+        // 0、线程池可能是 RUNNING 状态
+        // 1、任务移除失败（失败原因可能是任务已经被执行）
+        // 如果当前线程数为0，则创建一个非核心线程并传入任务为 null -- 结束
+        // 创建的线程不会马上执行任务，而是等待获取任务队列中的任务去执行
+        // 如果当前线程数不为0，则什么也不做。因为任务已经成功加入队列，总会执行。
+        else if (workerCountOf(recheck) == 0)
+            addWorker(null, false);
+    }
+    // 执行到这里说明：
+    // 0、线程池中的工作线程总数已经大于等于 corePoolSize
+    // 1、线程池可能不是 RUNNING 状态
+    // 2、线程池可能是 RUNNING 状态同时任务队列已经满了
+    // 如果向任务队列投放任务失败，则会尝试创建非核心线程传入任务执行
+    // 创建非核心线程失败，此时需要拒绝执行任务
+    else if (!addWorker(command, false))
+        // 执行拒绝策略 -- 结束
+        reject(command);
+}</code></pre>
+</div>
+</div>
+<div class="paragraph">
+<p>为什么需要二次检查线程池的运行状态，当前工作线程数量为 <code>0</code>，尝试创建一个非核心线程并且传入的任务对象为 <code>null</code>？这个可以看API注释：</p>
+</div>
+<div class="sidebarblock">
+<div class="content">
+<div class="paragraph">
+<p>如果一个任务成功加入任务队列，我们依然需要二次检查是否需要添加一个工作线程（因为所有存活的工作线程有可能在最后一次检查之后已经终结）或者执行当前方法的时候线程池是否已经 <code>shutdown</code> 了。所以我们需要二次检查线程池的状态，必要时把任务从任务队列中移除或者在没有可用的工作线程的前提下新建一个工作线程。</p>
+</div>
+</div>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="./images/ThreadPoolExecutor-process.jpeg" alt="ThreadPoolExecutor process">
+</div>
+</div>
+<div class="paragraph">
+<p><code>runWorker()</code> 方法的核心流程：</p>
+</div>
+<div class="imageblock">
+<div class="content">
+<img src="./images/ThreadPoolExecutor-runWorker.jpeg" alt="ThreadPoolExecutor runWorker">
 </div>
 </div>
 <div class="sect2">
@@ -288,13 +443,38 @@ import org.junit.Test;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.*;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 /**
  * @author D瓜哥, https://www.diguage.com/
  * @since 2020-03-10 10:50
  */
 public class ThreadPoolExecutorTest {
+
+    @Test
+    public void testStatus() {
+        int COUNT_BITS = Integer.SIZE - 3;
+        int COUNT_MASK = (1 &lt;&lt; COUNT_BITS) - 1;
+
+        // runState is stored in the high-order bits
+        int RUNNING = -1 &lt;&lt; COUNT_BITS;
+        int SHUTDOWN = 0 &lt;&lt; COUNT_BITS;
+        int STOP = 1 &lt;&lt; COUNT_BITS;
+        int TIDYING = 2 &lt;&lt; COUNT_BITS;
+        int TERMINATED = 3 &lt;&lt; COUNT_BITS;
+
+        System.out.printf("%32s // %d%n", Integer.toBinaryString(RUNNING), RUNNING);
+        System.out.printf("%32s // %d%n", Integer.toBinaryString(SHUTDOWN), SHUTDOWN);
+        System.out.printf("%32s // %d%n", Integer.toBinaryString(STOP), STOP);
+        System.out.printf("%32s // %d%n", Integer.toBinaryString(TIDYING), TIDYING);
+        System.out.printf("%32s // %d%n", Integer.toBinaryString(TERMINATED), TERMINATED);
+    }
+
     @Test
     public void testPoolSize() {
         ThreadPoolExecutor executorService
@@ -410,11 +590,29 @@ public class ThreadPoolExecutorTest {
 </div>
 </div>
 <div class="sect2">
-<h3 id="_参考资料"><a class="anchor" href="#_参考资料"></a>1.6. 参考资料</h3>
+<h3 id="_思考题"><a class="anchor" href="#_思考题"></a>1.6. 思考题</h3>
+<div class="paragraph">
+<p>自己实现一个线程池。</p>
+</div>
+</div>
+<div class="sect2">
+<h3 id="_参考资料"><a class="anchor" href="#_参考资料"></a>1.7. 参考资料</h3>
 <div class="olist arabic">
 <ol class="arabic">
 <li>
+<p><a href="http://www.throwable.club/2019/07/15/java-concurrency-thread-pool-executor/">JUC线程池ThreadPoolExecutor源码分析 - Throwable&#8217;s Blog</a></p>
+</li>
+<li>
+<p><a href="https://www.cnblogs.com/leesf456/p/5585627.html">【JUC】JDK1.8源码分析之ThreadPoolExecutor（一） - leesf - 博客园</a></p>
+</li>
+<li>
 <p><a href="https://mp.weixin.qq.com/s/baYuX8aCwQ9PP6k7TDl2Ww">Java线程池实现原理及其在美团业务中的实践</a></p>
+</li>
+<li>
+<p><a href="http://calvin1978.blogcn.com/articles/java-threadpool.html">Java ThreadPool的正确打开方式 | 江南白衣</a></p>
+</li>
+<li>
+<p><a href="http://calvin1978.blogcn.com/articles/tomcat-threadpool.html">Tomcat线程池，更符合大家想象的可扩展线程池 | 江南白衣</a></p>
 </li>
 <li>
 <p><a href="http://jindong.io/2015/03/30/java-concurrent-package-ThreadPoolExecutor/">Java并发包源码学习之线程池（一）ThreadPoolExecutor源码分析 - Jindong</a></p>
@@ -480,12 +678,6 @@ public class ThreadPoolExecutorTest {
 <li>
 <p><a href="http://www.cnblogs.com/rilley/archive/2012/02/07/2341767.html">ThreadPoolExecutor源码分析 - rilley - 博客园</a></p>
 </li>
-<li>
-<p><a href="http://calvin1978.blogcn.com/articles/java-threadpool.html">Java ThreadPool的正确打开方式 | 江南白衣</a></p>
-</li>
-<li>
-<p><a href="http://calvin1978.blogcn.com/articles/tomcat-threadpool.html">Tomcat线程池，更符合大家想象的可扩展线程池 | 江南白衣</a></p>
-</li>
 </ol>
 </div>
 </div>
@@ -494,7 +686,7 @@ public class ThreadPoolExecutorTest {
 </div>
 <div id="footer">
 <div id="footer-text">
-Last updated 2020-04-09 12:46:55 +0800
+Last updated 2020-04-09 21:02:13 +0800
 </div>
 </div>
 </body>
